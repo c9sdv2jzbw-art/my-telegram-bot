@@ -14,6 +14,7 @@ from telegram.ext import (
     ApplicationHandlerStop,
 )
 
+# --- НАСТРОЙКИ ---
 TOKEN = os.environ.get("BOT_TOKEN")
 GROUP_CHAT_ID = -1004469487979
 
@@ -33,7 +34,7 @@ VOTE_NOTE = (
     "У каждого участника есть право вето — любой голос «Против» блокирует вступление.</i>"
 )
 
-ASK_AGREE, ASK_NAME, ASK_SOURCE, ASK_ABOUT = range(4)
+ASK_AGREE, ASK_NAME, ASK_SOURCE, ASK_ABOUT, ASK_ABOUT_TEXT = range(5)
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
@@ -41,15 +42,30 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+# --- АНКЕТА ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data.clear()
     await update.message.reply_text(RULES_TEXT, parse_mode="HTML")
     return ASK_AGREE
 
 
-async def wrong_type(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+# --- Обработчики "не того типа" для каждого шага ---
+async def wrong_type_text_only(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "Пожалуйста, ответь текстом 🙂 На этом шаге фото не подойдёт."
+    )
+
+
+async def wrong_type_about(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(
+        "Пожалуйста, отправь текст или фото с подписью 🙂 "
+        "Другие типы сообщений на этом шаге не подойдут."
+    )
+
+
+async def wrong_type_about_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(
+        "Пожалуйста, напиши текстом пару слов о себе 🙂 Фото мы уже получили."
     )
 
 
@@ -87,10 +103,21 @@ async def receive_about(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     msg = update.message
     if msg.photo:
         context.user_data["photo"] = msg.photo[-1].file_id
-        context.user_data["about"] = msg.caption or "(без описания)"
+        if msg.caption:
+            context.user_data["about"] = msg.caption
+            return await finish_survey(update, context)
+        await msg.reply_text(
+            "Отличное фото! Теперь напиши текстом пару слов о себе и о своем мини."
+        )
+        return ASK_ABOUT_TEXT
     else:
         context.user_data["photo"] = None
         context.user_data["about"] = msg.text
+        return await finish_survey(update, context)
+
+
+async def receive_about_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data["about"] = update.message.text
     return await finish_survey(update, context)
 
 
@@ -179,6 +206,7 @@ async def post_application_and_poll(context: ContextTypes.DEFAULT_TYPE, user_id:
     }
 
 
+# --- ГОЛОСОВАНИЕ ---
 async def receive_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     answer = update.poll_answer
     poll_id = answer.poll_id
@@ -270,6 +298,7 @@ async def reject_application(context: ContextTypes.DEFAULT_TYPE, poll_data: dict
         logger.error(f"Ошибка при отклонении: {e}")
 
 
+# --- МОТИВАЦИЯ → ПЕРЕГОЛОСОВАНИЕ ---
 async def motivation_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
     awaiting = context.bot_data.get("awaiting_motivation", set())
@@ -300,24 +329,27 @@ async def motivation_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
     raise ApplicationHandlerStop
 
 
+# --- ЗАПУСК ---
 def main() -> None:
     application = ApplicationBuilder().token(TOKEN).build()
 
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
         states={
+            # --- ТОЛЬКО ТЕКСТ ---
             ASK_AGREE: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, agree),
-                MessageHandler(~filters.TEXT & ~filters.COMMAND, wrong_type),
+                MessageHandler(~filters.TEXT & ~filters.COMMAND, wrong_type_text_only),
             ],
             ASK_NAME: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, ask_source),
-                MessageHandler(~filters.TEXT & ~filters.COMMAND, wrong_type),
+                MessageHandler(~filters.TEXT & ~filters.COMMAND, wrong_type_text_only),
             ],
             ASK_SOURCE: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, ask_about),
-                MessageHandler(~filters.TEXT & ~filters.COMMAND, wrong_type),
+                MessageHandler(~filters.TEXT & ~filters.COMMAND, wrong_type_text_only),
             ],
+            # --- ТЕКСТ ИЛИ ФОТО ---
             ASK_ABOUT: [
                 MessageHandler(
                     filters.PHOTO | (filters.TEXT & ~filters.COMMAND),
@@ -325,8 +357,13 @@ def main() -> None:
                 ),
                 MessageHandler(
                     ~filters.PHOTO & ~filters.TEXT & ~filters.COMMAND,
-                    wrong_type,
+                    wrong_type_about,
                 ),
+            ],
+            # --- ЖДЁМ ТЕКСТ ПОСЛЕ ФОТО ---
+            ASK_ABOUT_TEXT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_about_text),
+                MessageHandler(~filters.TEXT & ~filters.COMMAND, wrong_type_about_text),
             ],
         },
         fallbacks=[CommandHandler("start", start)],
