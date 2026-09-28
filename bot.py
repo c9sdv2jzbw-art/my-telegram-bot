@@ -315,7 +315,7 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main())
+    main()
 logger = logging.getLogger(__name__)
 
 
