@@ -1,4 +1,5 @@
 import os
+import html
 import logging
 from telegram import Update
 from telegram.ext import (
@@ -9,55 +10,118 @@ from telegram.ext import (
     PollAnswerHandler,
     filters,
     ContextTypes,
+    ApplicationHandlerStop,
 )
 
 # --- НАСТРОЙКИ ---
 TOKEN = os.environ.get("BOT_TOKEN")
 GROUP_CHAT_ID = -1004469487979
-# -----------------
 
-ASK_NAME, ASK_PURPOSE, ASK_SOURCE = range(3)
+RULES_TEXT = (
+    "👋 <b>Привет!</b>\n\n"
+    "Прежде чем подать заявку, ознакомься с правилами чата:\n\n"
+    "1. Уважай других участников — без оскорблений и агрессии.\n"
+    "2. Никакого спама, рекламы и сторонних ссылок без согласования.\n"
+    "3. Не разглашай личную информацию участников.\n"
+    "4. Придерживайся темы чата.\n"
+    "5. Конфликты решай в личке, не в общем чате.\n\n"
+    "<b>Согласен(на) с правилами?</b> Напиши «Да» или «Нет»."
+)
+
+MIN_VOTES = 2  # минимум голосов для решения
+
+ASK_AGREE, ASK_NAME, ASK_SOURCE, ASK_ABOUT, ASK_PHOTO, ASK_MOTIVATION = range(6)
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
+
 # --- АНКЕТА ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    await update.message.reply_text("Привет! Давай познакомимся. Как тебя зовут?")
-    return ASK_NAME
+    context.user_data.clear()
+    await update.message.reply_text(RULES_TEXT, parse_mode="HTML")
+    return ASK_AGREE
 
-async def ask_purpose(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data["name"] = update.message.text
-    await update.message.reply_text("Приятно познакомиться! А зачем ты хочешь вступить в нашу группу?")
-    return ASK_PURPOSE
+
+async def agree(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    answer = update.message.text.strip().lower()
+    if answer in ("да", "yes", "ага", "ок", "ok", "согласен", "согласна"):
+        await update.message.reply_text("Отлично! Как тебя зовут?")
+        return ASK_NAME
+    elif answer in ("нет", "no", "не"):
+        await update.message.reply_text(
+            "Жаль. Без согласия с правилами вступить нельзя. Если передумаешь — напиши /start."
+        )
+        return ConversationHandler.END
+    else:
+        await update.message.reply_text("Пожалуйста, ответь «Да» или «Нет».")
+        return ASK_AGREE
+
 
 async def ask_source(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data["purpose"] = update.message.text
-    await update.message.reply_text("Понятно. А откуда ты узнал о нашей группе?")
+    context.user_data["name"] = update.message.text
+    await update.message.reply_text("Приятно познакомиться! А как ты узнал(а) о нашей группе?")
     return ASK_SOURCE
 
-async def finish_survey(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+
+async def ask_about(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data["source"] = update.message.text
+    await update.message.reply_text("Кратко расскажи о себе.")
+    return ASK_ABOUT
+
+
+async def ask_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data["about"] = update.message.text
+    await update.message.reply_text(
+        "Хочешь прикрепить фото? Отправь его сейчас.\n"
+        "Если не хочешь — напиши /skip."
+    )
+    return ASK_PHOTO
+
+
+async def receive_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data["photo"] = update.message.photo[-1].file_id
+    return await finish_survey(update, context)
+
+
+async def skip_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data["photo"] = None
+    return await finish_survey(update, context)
+
+
+async def finish_survey(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user = update.effective_user
+    name = html.escape(context.user_data["name"])
+    source = html.escape(context.user_data["source"])
+    about = html.escape(context.user_data["about"])
+    photo_id = context.user_data.get("photo")
 
     survey_text = (
         f"📋 <b>Новая заявка на вступление</b>\n\n"
-        f"<b>Имя:</b> {context.user_data['name']}\n"
-        f"<b>Цель:</b> {context.user_data['purpose']}\n"
-        f"<b>Источник:</b> {context.user_data['source']}\n\n"
+        f"<b>Имя:</b> {name}\n"
+        f"<b>Узнал(а) о нас:</b> {source}\n"
+        f"<b>О себе:</b> {about}\n\n"
         f"Пользователь: {user.mention_html()}"
     )
 
     try:
-        await context.bot.send_message(
-            chat_id=GROUP_CHAT_ID,
-            text=survey_text,
-            parse_mode="HTML"
-        )
+        if photo_id:
+            message = await context.bot.send_photo(
+                chat_id=GROUP_CHAT_ID,
+                photo=photo_id,
+                caption=survey_text,
+                parse_mode="HTML",
+            )
+        else:
+            message = await context.bot.send_message(
+                chat_id=GROUP_CHAT_ID,
+                text=survey_text,
+                parse_mode="HTML",
+            )
 
-        message = await context.bot.send_poll(
+        poll_msg = await context.bot.send_poll(
             chat_id=GROUP_CHAT_ID,
             question=f"Принять {context.user_data['name']} в группу?",
             options=["✅ За", "❌ Против"],
@@ -65,14 +129,14 @@ async def finish_survey(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
             allows_multiple_answers=False,
         )
 
-        context.bot_data[message.poll.id] = {
+        context.bot_data[poll_msg.poll.id] = {
             "chat_id": GROUP_CHAT_ID,
-            "message_id": message.message_id,
             "votes_yes": 0,
             "votes_no": 0,
             "voters": {},
             "user_id": user.id,
-            "user_name": context.user_data['name'],
+            "user_name": context.user_data["name"],
+            "decided": False,
         }
 
         await update.message.reply_text(
@@ -85,19 +149,21 @@ async def finish_survey(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     context.user_data.clear()
     return ConversationHandler.END
 
+
 # --- ГОЛОСОВАНИЕ ---
 async def receive_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     answer = update.poll_answer
     poll_id = answer.poll_id
-
     if poll_id not in context.bot_data:
         return
 
     poll_data = context.bot_data[poll_id]
+    if poll_data["decided"]:
+        return
+
     user_id = answer.user.id
     selected = answer.option_ids[0] if answer.option_ids else None
 
-    # Убираем старый голос пользователя, если он менял
     old = poll_data["voters"].get(user_id)
     if old == 0:
         poll_data["votes_yes"] -= 1
@@ -113,44 +179,92 @@ async def receive_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     total = poll_data["votes_yes"] + poll_data["votes_no"]
 
-    # Условие: 2/3 от проголосовавших "За" (и минимум 3 голоса)
-    if total >= 3 and poll_data["votes_yes"] >= (2 * total / 3):
-        try:
-            invite_link = await context.bot.create_chat_invite_link(
-                chat_id=GROUP_CHAT_ID,
-                member_limit=1,
-                name=f"invite_{poll_data['user_id']}"
-            )
+    # 🚫 ПРАВО ВЕТО: один голос против — блокирует вступление
+    if poll_data["votes_no"] >= 1:
+        await reject_application(context, poll_data, reason="вето")
+        poll_data["decided"] = True
+        return
 
-            await context.bot.send_message(
-                chat_id=poll_data["user_id"],
-                text=f"🎉 Поздравляем! Твоя заявка одобрена.\n\nВот твоя персональная ссылка для входа:\n{invite_link.invite_link}"
-            )
+    # ✅ Одобрение: минимум MIN_VOTES голосов и >= 1/2 "За"
+    if total >= MIN_VOTES and poll_data["votes_yes"] * 2 >= total:
+        await approve_application(context, poll_data)
+        poll_data["decided"] = True
 
-            await context.bot.send_message(
-                chat_id=GROUP_CHAT_ID,
-                text=f"✅ Заявка от {poll_data['user_name']} одобрена!"
-            )
 
-            del context.bot_data[poll_id]
+async def approve_application(context: ContextTypes.DEFAULT_TYPE, poll_data: dict) -> None:
+    try:
+        invite_link = await context.bot.create_chat_invite_link(
+            chat_id=GROUP_CHAT_ID,
+            member_limit=1,
+            name=f"invite_{poll_data['user_id']}",
+        )
+        await context.bot.send_message(
+            chat_id=poll_data["user_id"],
+            text=(
+                "🎉 Поздравляем! Твоя заявка одобрена.\n\n"
+                f"Вот твоя персональная ссылка для входа:\n{invite_link.invite_link}"
+            ),
+        )
+        await context.bot.send_message(
+            chat_id=GROUP_CHAT_ID,
+            text=f"✅ Заявка от {poll_data['user_name']} одобрена!",
+        )
+    except Exception as e:
+        logger.error(f"Ошибка при одобрении: {e}")
 
-        except Exception as e:
-            logger.error(f"Ошибка при одобрении: {e}")
 
-    # Условие: большинство "Против" — отклоняем
-    elif total >= 3 and poll_data["votes_no"] > poll_data["votes_yes"]:
-        try:
-            await context.bot.send_message(
-                chat_id=poll_data["user_id"],
-                text="😔 К сожалению, участники проголосовали против твоей заявки."
-            )
-            await context.bot.send_message(
-                chat_id=GROUP_CHAT_ID,
-                text=f"❌ Заявка от {poll_data['user_name']} отклонена."
-            )
-            del context.bot_data[poll_id]
-        except Exception as e:
-            logger.error(f"Ошибка при отклонении: {e}")
+async def reject_application(context: ContextTypes.DEFAULT_TYPE, poll_data: dict, reason: str = "") -> None:
+    try:
+        await context.bot.send_message(
+            chat_id=poll_data["user_id"],
+            text=(
+                "😔 К сожалению, участники проголосовали против твоей заявки.\n\n"
+                "Расскажи, пожалуйста, какая у тебя мотивация быть в группе "
+                "и что ты планируешь делать? Мы передадим это участникам."
+            ),
+        )
+        await context.bot.send_message(
+            chat_id=GROUP_CHAT_ID,
+            text=f"❌ Заявка от {poll_data['user_name']} отклонена.",
+        )
+        # Запоминаем, что ждём мотивацию
+        awaiting = context.bot_data.setdefault("awaiting_motivation", set())
+        awaiting.add(poll_data["user_id"])
+        names = context.bot_data.setdefault("rejected_names", {})
+        names[poll_data["user_id"]] = poll_data["user_name"]
+    except Exception as e:
+        logger.error(f"Ошибка при отклонении: {e}")
+
+
+# --- МОТИВАЦИЯ ПОСЛЕ ОТКАЗА ---
+async def motivation_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    awaiting = context.bot_data.get("awaiting_motivation", set())
+    if user_id not in awaiting:
+        return  # не наш случай — пусть обрабатывают другие хендлеры
+
+    awaiting.discard(user_id)
+    motivation = html.escape(update.message.text)
+    name = context.bot_data.get("rejected_names", {}).get(user_id, "участник")
+
+    try:
+        await context.bot.send_message(
+            chat_id=GROUP_CHAT_ID,
+            text=(
+                f"💬 <b>Мотивация от {html.escape(str(name))}</b>:\n{motivation}\n\n"
+                f"<i>Если участники захотят — может быть рассмотрено повторно.</i>"
+            ),
+            parse_mode="HTML",
+        )
+        await update.message.reply_text(
+            "Спасибо! Мы передали твою мотивацию в группу.\n\n"
+            "Хочешь попробовать снова? Отправь /start."
+        )
+    except Exception as e:
+        logger.error(f"Ошибка при отправке мотивации: {e}")
+
+    raise ApplicationHandlerStop
+
 
 # --- ЗАПУСК ---
 def main() -> None:
@@ -159,17 +273,28 @@ def main() -> None:
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
         states={
-            ASK_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_purpose)],
-            ASK_PURPOSE: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_source)],
-            ASK_SOURCE: [MessageHandler(filters.TEXT & ~filters.COMMAND, finish_survey)],
+            ASK_AGREE: [MessageHandler(filters.TEXT & ~filters.COMMAND, agree)],
+            ASK_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_source)],
+            ASK_SOURCE: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_about)],
+            ASK_ABOUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_photo)],
+            ASK_PHOTO: [
+                CommandHandler("skip", skip_photo),
+                MessageHandler(filters.PHOTO, receive_photo),
+            ],
         },
-        fallbacks=[],
+        fallbacks=[CommandHandler("start", start)],
     )
 
+    # Сначала — обработчик мотивации (group=-1), чтобы он перехватывал ответы после отказа
+    application.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND, motivation_handler),
+        group=-1,
+    )
     application.add_handler(conv_handler)
     application.add_handler(PollAnswerHandler(receive_poll_answer))
 
     application.run_polling()
+
 
 if __name__ == "__main__":
     main()
