@@ -74,8 +74,8 @@ async def ask_source(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 async def ask_about(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data["source"] = update.message.text
     await update.message.reply_text(
-        "Пожалуйста, кратко расскажи о себе и о своей машине "
-        "(в скобочках можешь приложить фото своего мини)."
+        "Пожалуйста, кратко расскажи о себе и о своем мини "
+        "(можешь приложить фото своего мини)."
     )
     return ASK_ABOUT
 
