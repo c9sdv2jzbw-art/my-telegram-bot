@@ -9,6 +9,7 @@ from telegram.ext import (
     MessageHandler,
     ConversationHandler,
     PollAnswerHandler,
+    ChatJoinRequestHandler,
     filters,
     ContextTypes,
     ApplicationHandlerStop,
@@ -258,6 +259,11 @@ async def safe_stop_poll(context: ContextTypes.DEFAULT_TYPE, poll_data: dict) ->
 
 async def approve_application(context: ContextTypes.DEFAULT_TYPE, poll_data: dict) -> None:
     try:
+        # Запоминаем пользователя как одобренного — понадобится при обработке заявки
+        approved = context.bot_data.setdefault("approved_users", set())
+        approved.add(poll_data["user_id"])
+
+        # Создаём одноразовую ссылку
         invite_link = await context.bot.create_chat_invite_link(
             chat_id=GROUP_CHAT_ID,
             member_limit=1,
@@ -267,7 +273,8 @@ async def approve_application(context: ContextTypes.DEFAULT_TYPE, poll_data: dic
             chat_id=poll_data["user_id"],
             text=(
                 "🎉 Поздравляем! Твоя заявка одобрена.\n\n"
-                f"Вот твоя персональная ссылка для входа:\n{invite_link.invite_link}"
+                f"Вот твоя персональная ссылка для входа:\n{invite_link.invite_link}\n\n"
+                "После перехода по ссылке бот автоматически примет тебя в группу."
             ),
         )
         await context.bot.send_message(
@@ -297,6 +304,30 @@ async def reject_application(context: ContextTypes.DEFAULT_TYPE, poll_data: dict
         awaiting.add(poll_data["user_id"])
     except Exception as e:
         logger.error(f"Ошибка при отклонении: {e}")
+
+
+# --- АВТООДОБРЕНИЕ ЗАЯВОК НА ВСТУПЛЕНИЕ ---
+async def handle_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Автоматически одобряет заявку, если пользователь прошел голосование."""
+    join_request = update.chat_join_request
+    user = join_request.from_user
+    user_id = user.id
+
+    approved = context.bot_data.get("approved_users", set())
+
+    if user_id in approved:
+        try:
+            await join_request.approve()
+            logger.info(f"✅ Заявка от {user_id} одобрена автоматически.")
+            approved.discard(user_id)
+        except Exception as e:
+            logger.error(f"Не удалось одобрить заявку {user_id}: {e}")
+    else:
+        try:
+            await join_request.decline()
+            logger.info(f"❌ Заявка от {user_id} отклонена (нет в списке одобренных).")
+        except Exception as e:
+            logger.error(f"Не удалось отклонить заявку {user_id}: {e}")
 
 
 # --- МОТИВАЦИЯ → ПЕРЕГОЛОСОВАНИЕ ---
@@ -337,7 +368,6 @@ def main() -> None:
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
         states={
-            # --- ТОЛЬКО ТЕКСТ ---
             ASK_AGREE: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, agree),
                 MessageHandler(~filters.TEXT & ~filters.COMMAND, wrong_type_text_only),
@@ -350,7 +380,6 @@ def main() -> None:
                 MessageHandler(filters.TEXT & ~filters.COMMAND, ask_about),
                 MessageHandler(~filters.TEXT & ~filters.COMMAND, wrong_type_text_only),
             ],
-            # --- ТЕКСТ ИЛИ ФОТО ---
             ASK_ABOUT: [
                 MessageHandler(
                     filters.PHOTO | (filters.TEXT & ~filters.COMMAND),
@@ -361,7 +390,6 @@ def main() -> None:
                     wrong_type_about,
                 ),
             ],
-            # --- ЖДЁМ ТЕКСТ ПОСЛЕ ФОТО ---
             ASK_ABOUT_TEXT: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, receive_about_text),
                 MessageHandler(~filters.TEXT & ~filters.COMMAND, wrong_type_about_text),
@@ -376,6 +404,7 @@ def main() -> None:
     )
     application.add_handler(conv_handler)
     application.add_handler(PollAnswerHandler(receive_poll_answer))
+    application.add_handler(ChatJoinRequestHandler(handle_join_request))
 
     application.run_polling()
 
