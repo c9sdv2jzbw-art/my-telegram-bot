@@ -427,8 +427,9 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     lines = ["🕐 <b>Последние события:</b>", ""]
     for ev in recent:
         t = ev["time"].strftime("%d.%m %H:%M:%S")
-        uname = f"@{ev['username']}" if ev["username"] else ev["name"]
-        lines.append(f"<code>{t}</code> — {html.escape(uname)} — <i>{ev['kind']}</i>")
+        # Настоящее упоминание — кликабельное
+        mention = f'<a href="tg://user?id={ev["user_id"]}">{html.escape(ev["name"])}</a>'
+        lines.append(f"<code>{t}</code> — {mention} — <i>{ev['kind']}</i>")
 
     # Информация о самой последней активности
     last = activity[-1]
