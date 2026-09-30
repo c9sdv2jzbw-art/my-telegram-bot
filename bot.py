@@ -16,7 +16,7 @@ from telegram.ext import (
 
 # --- НАСТРОЙКИ ---
 TOKEN = os.environ.get("BOT_TOKEN")
-GROUP_CHAT_ID = -1004469487979
+GROUP_CHAT_ID = -1004344602549
 
 RULES_TEXT = (
     "👋 <b>Привет!</b>\n\n"
