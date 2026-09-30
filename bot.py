@@ -1,6 +1,8 @@
 import os
 import html
 import logging
+from collections import deque
+from datetime import datetime
 from math import ceil
 from telegram import Update
 from telegram.ext import (
@@ -10,6 +12,7 @@ from telegram.ext import (
     ConversationHandler,
     PollAnswerHandler,
     ChatJoinRequestHandler,
+    TypeHandler,
     filters,
     ContextTypes,
     ApplicationHandlerStop,
@@ -18,6 +21,7 @@ from telegram.ext import (
 # --- НАСТРОЙКИ ---
 TOKEN = os.environ.get("BOT_TOKEN")
 GROUP_CHAT_ID = -1004344602549
+ADMIN_ID = int(os.environ.get("ADMIN_CHAT_ID", "357312670"))
 
 RULES_TEXT = (
     "👋 <b>Привет!</b>\n\n"
@@ -44,6 +48,39 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+# --- ЛОГИРОВАНИЕ АКТИВНОСТИ ---
+async def log_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if not user:
+        return
+
+    kind = "?"
+    if update.message:
+        if update.message.text:
+            kind = "text"
+        elif update.message.photo:
+            kind = "photo"
+        else:
+            kind = "message"
+    elif update.callback_query:
+        kind = "button"
+    elif update.poll_answer:
+        kind = "vote"
+    elif update.chat_join_request:
+        kind = "join_request"
+
+    logger.info(f"UPDATE | {user.full_name} (@{user.username}) | id={user.id} | {kind}")
+
+    activity = context.bot_data.setdefault("activity_log", deque(maxlen=50))
+    activity.append({
+        "time": datetime.now(),
+        "user_id": user.id,
+        "name": user.full_name,
+        "username": user.username,
+        "kind": kind,
+    })
+
+
 # --- АНКЕТА ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data.clear()
@@ -51,7 +88,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return ASK_AGREE
 
 
-# --- Обработчики "не того типа" для каждого шага ---
 async def wrong_type_text_only(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "Пожалуйста, ответь текстом 🙂 На этом шаге фото не подойдёт."
@@ -216,7 +252,7 @@ async def receive_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     poll_data = context.bot_data[poll_id]
-    if poll_data.get("decided"):
+    if not isinstance(poll_data, dict) or poll_data.get("decided"):
         return
 
     user_id = answer.user.id
@@ -259,11 +295,9 @@ async def safe_stop_poll(context: ContextTypes.DEFAULT_TYPE, poll_data: dict) ->
 
 async def approve_application(context: ContextTypes.DEFAULT_TYPE, poll_data: dict) -> None:
     try:
-        # Запоминаем пользователя как одобренного — понадобится при обработке заявки
         approved = context.bot_data.setdefault("approved_users", set())
         approved.add(poll_data["user_id"])
 
-        # Создаём одноразовую ссылку
         invite_link = await context.bot.create_chat_invite_link(
             chat_id=GROUP_CHAT_ID,
             member_limit=1,
@@ -361,6 +395,44 @@ async def motivation_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
     raise ApplicationHandlerStop
 
 
+# --- КОМАНДА /status ---
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("Команда доступна только администратору.")
+        return
+
+    activity = list(context.bot_data.get("activity_log", []))
+
+    if not activity:
+        await update.message.reply_text(
+            "🕐 С ботом ещё никто не общался (с момента последнего запуска)."
+        )
+        return
+
+    last = activity[-1]
+    t = last["time"].strftime("%d.%m.%Y %H:%M:%S")
+    uname = f"@{last['username']}" if last["username"] else last["name"]
+
+    delta = datetime.now() - last["time"]
+    secs = int(delta.total_seconds())
+    if secs < 60:
+        ago = f"{secs} сек. назад"
+    elif secs < 3600:
+        ago = f"{secs // 60} мин. назад"
+    elif secs < 86400:
+        ago = f"{secs // 3600} ч. назад"
+    else:
+        ago = f"{secs // 86400} дн. назад"
+
+    await update.message.reply_text(
+        f"🕐 <b>Последняя активность:</b>\n"
+        f"{t} ({ago})\n"
+        f"Пользователь: {html.escape(uname)}\n"
+        f"Тип: <code>{last['kind']}</code>",
+        parse_mode="HTML",
+    )
+
+
 # --- ЗАПУСК ---
 def main() -> None:
     application = ApplicationBuilder().token(TOKEN).build()
@@ -398,6 +470,10 @@ def main() -> None:
         fallbacks=[CommandHandler("start", start)],
     )
 
+    # Логгер всех апдейтов — первым, в группе -2
+    application.add_handler(TypeHandler(Update, log_update), group=-2)
+
+    application.add_handler(CommandHandler("status", cmd_status))
     application.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, motivation_handler),
         group=-1,
