@@ -54,10 +54,23 @@ async def log_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if not user:
         return
 
+    # Пропускаем собственные действия админа
+    if user.id == ADMIN_ID:
+        return
+
+    # Пропускаем /status (но /start логируем)
+    if update.message and update.message.text:
+        text = update.message.text
+        if text.startswith("/") and not text.startswith("/start"):
+            return
+
     kind = "?"
     if update.message:
         if update.message.text:
-            kind = "text"
+            if update.message.text.startswith("/start"):
+                kind = "start"
+            else:
+                kind = "text"
         elif update.message.photo:
             kind = "photo"
         else:
@@ -342,7 +355,6 @@ async def reject_application(context: ContextTypes.DEFAULT_TYPE, poll_data: dict
 
 # --- АВТООДОБРЕНИЕ ЗАЯВОК НА ВСТУПЛЕНИЕ ---
 async def handle_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Автоматически одобряет заявку, если пользователь прошел голосование."""
     join_request = update.chat_join_request
     user = join_request.from_user
     user_id = user.id
@@ -409,10 +421,17 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         )
         return
 
-    last = activity[-1]
-    t = last["time"].strftime("%d.%m.%Y %H:%M:%S")
-    uname = f"@{last['username']}" if last["username"] else last["name"]
+    # Последние 10 событий, от новых к старым
+    recent = list(reversed(activity))[:10]
 
+    lines = ["🕐 <b>Последние события:</b>", ""]
+    for ev in recent:
+        t = ev["time"].strftime("%d.%m %H:%M:%S")
+        uname = f"@{ev['username']}" if ev["username"] else ev["name"]
+        lines.append(f"<code>{t}</code> — {html.escape(uname)} — <i>{ev['kind']}</i>")
+
+    # Информация о самой последней активности
+    last = activity[-1]
     delta = datetime.now() - last["time"]
     secs = int(delta.total_seconds())
     if secs < 60:
@@ -424,13 +443,10 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     else:
         ago = f"{secs // 86400} дн. назад"
 
-    await update.message.reply_text(
-        f"🕐 <b>Последняя активность:</b>\n"
-        f"{t} ({ago})\n"
-        f"Пользователь: {html.escape(uname)}\n"
-        f"Тип: <code>{last['kind']}</code>",
-        parse_mode="HTML",
-    )
+    lines.append("")
+    lines.append(f"⏱ Последняя активность: <b>{ago}</b>")
+
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
 
 # --- ЗАПУСК ---
@@ -470,9 +486,7 @@ def main() -> None:
         fallbacks=[CommandHandler("start", start)],
     )
 
-    # Логгер всех апдейтов — первым, в группе -2
     application.add_handler(TypeHandler(Update, log_update), group=-2)
-
     application.add_handler(CommandHandler("status", cmd_status))
     application.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, motivation_handler),
