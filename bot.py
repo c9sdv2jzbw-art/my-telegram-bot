@@ -617,10 +617,22 @@ async def motivation_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
     raise ApplicationHandlerStop
 
 
-# --- FALLBACK ---
+# --- FALLBACK: бот потерял контекст (после рестарта или завершённой анкеты) ---
 async def fallback_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_chat.type != "private":
         return
+
+    user_id = update.effective_user.id
+
+    # Пользователь в активной анкете — не мешаем
+    if user_id in context.bot_data.get("progress", {}):
+        return
+
+    # Пользователь ждёт мотивацию — обработает motivation_handler
+    if user_id in context.bot_data.get("awaiting_motivation", set()):
+        return
+
+    # Есть активный ConversationHandler — не мешаем
     if context.user_data:
         return
 
