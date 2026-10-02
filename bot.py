@@ -18,9 +18,17 @@ from telegram.ext import (
 )
 
 # --- НАСТРОЙКИ ---
-TOKEN = os.environ.get("BOT_TOKEN")
-GROUP_CHAT_ID = -1004344602549
+# Дефолты — для теста. В Railway перебьются переменными BOT_TOKEN / GROUP_CHAT_ID.
+TOKEN = os.environ.get("BOT_TOKEN") or "8953720376:AAFCUKjvwLiHHgHcv-Sq5uX63X3G7syaZM8"
+GROUP_CHAT_ID = int(os.environ.get("GROUP_CHAT_ID", "-1004469487979"))
 ADMIN_ID = int(os.environ.get("ADMIN_CHAT_ID", "357312670"))
+
+# Тайминги напоминаний (в секундах).
+# Для теста — минуты. Потом вернёшь: 30*60, 2*60*60, 24*60*60, 26*60*60
+T_REMIND_1 = 60
+T_REMIND_2 = 120
+T_REMIND_3 = 180
+T_AUTOPUB  = 240
 
 RULES_TEXT = (
     "👋 <b>Привет!</b>\n\n"
@@ -51,12 +59,119 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-# --- ЛОГИРОВАНИЕ АКТИВНОСТИ ---
+# --- ПРОГРЕСС ---
+def get_progress(context, user_id):
+    return context.bot_data.setdefault("progress", {}).setdefault(user_id, {})
+
+
+def pop_progress(context, user_id):
+    return context.bot_data.get("progress", {}).pop(user_id, None)
+
+
+# --- НАПОМИНАНИЯ ---
+def _reminder_names(user_id):
+    return [f"r1_{user_id}", f"r2_{user_id}", f"r3_{user_id}", f"autopub_{user_id}"]
+
+
+def cancel_all_reminders(context, user_id):
+    for name in _reminder_names(user_id):
+        for j in context.job_queue.get_jobs_by_name(name):
+            j.schedule_removal()
+
+
+def schedule_reminders(context, user_id):
+    cancel_all_reminders(context, user_id)
+    context.job_queue.run_once(
+        send_reminder_1, when=T_REMIND_1, data={"user_id": user_id}, name=f"r1_{user_id}"
+    )
+    context.job_queue.run_once(
+        send_reminder_2, when=T_REMIND_2, data={"user_id": user_id}, name=f"r2_{user_id}"
+    )
+    context.job_queue.run_once(
+        send_reminder_3, when=T_REMIND_3, data={"user_id": user_id}, name=f"r3_{user_id}"
+    )
+    context.job_queue.run_once(
+        auto_publish_application, when=T_AUTOPUB, data={"user_id": user_id}, name=f"autopub_{user_id}"
+    )
+
+
+async def _safe_send(context, user_id, text):
+    try:
+        await context.bot.send_message(chat_id=user_id, text=text)
+    except Exception as e:
+        logger.warning(f"Не удалось отправить сообщение {user_id}: {e}")
+
+
+async def send_reminder_1(context):
+    user_id = context.job.data["user_id"]
+    await _safe_send(
+        context, user_id,
+        "👋 Привет! Ты начал заполнять анкету, но не закончил. Продолжим? "
+        "Ответь на последний вопрос или напиши /start, чтобы начать заново."
+    )
+
+
+async def send_reminder_2(context):
+    user_id = context.job.data["user_id"]
+    await _safe_send(
+        context, user_id,
+        "⏰ Напоминаем о себе! Мы всё ещё ждём твою анкету. "
+        "Ответь на последний вопрос, чтобы завершить."
+    )
+
+
+async def send_reminder_3(context):
+    user_id = context.job.data["user_id"]
+    await _safe_send(
+        context, user_id,
+        "🙏 Мы очень тебя ждём! Заверши анкету — осталось совсем немного. "
+        "Если не хочешь отвечать на последний вопрос, напиши «продолжить»."
+    )
+
+
+async def auto_publish_application(context):
+    """Через T_AUTOPUB: если есть имя и источник — публикуем анкету с пометкой."""
+    user_id = context.job.data["user_id"]
+    progress = context.bot_data.get("progress", {}).get(user_id)
+    if not progress:
+        return
+
+    # Минимум: имя и источник (правила уже согласованы, раз есть прогресс)
+    if not (progress.get("name") and progress.get("source")):
+        return
+
+    cancel_all_reminders(context, user_id)
+
+    apps = context.bot_data.setdefault("applications", {})
+    apps[user_id] = {
+        "name": progress.get("name", ""),
+        "source": progress.get("source", ""),
+        "source_photo": progress.get("source_photo"),
+        "about": progress.get("about", ""),
+        "photo_id": progress.get("photo"),
+        "mention": progress.get("mention", ""),
+        "skipped_about": False,
+        "incomplete": True,
+        "created": datetime.now(),
+    }
+    pop_progress(context, user_id)
+
+    try:
+        await post_application_and_poll(context, user_id, is_revote=False)
+        await _safe_send(
+            context, user_id,
+            "⏰ Мы так и не дождались ответа на последний вопрос, но всё равно "
+            "отправили твою анкету на рассмотрение — с пометкой, что часть анкеты "
+            "осталась незаполненной.\n\nРезультат придёт в этот чат."
+        )
+    except Exception as e:
+        logger.error(f"Auto-publish error: {e}")
+
+
+# --- ЛОГИРОВАНИЕ ---
 async def log_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
-    if not user:
-        return
-    if user.id == ADMIN_ID:
+    if not user or user.id == ADMIN_ID:
         return
 
     if update.message and update.message.text:
@@ -96,29 +211,31 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user = update.effective_user
     user_id = user.id
 
-    # Если пользователь ждал мотивацию — снимаем
     awaiting = context.bot_data.get("awaiting_motivation", set())
     awaiting.discard(user_id)
 
-    # Очищаем возможный старый прогресс
-    context.bot_data.get("progress", {}).pop(user_id, None)
+    pop_progress(context, user_id)
 
-    # Создаём свежий прогресс
-    progress = context.bot_data.setdefault("progress", {}).setdefault(user_id, {})
+    progress = get_progress(context, user_id)
     progress["started"] = datetime.now()
     progress["mention"] = user.mention_html()
 
     await update.message.reply_text(RULES_TEXT, parse_mode="HTML")
+    schedule_reminders(context, user_id)
     return ASK_AGREE
 
 
 async def wrong_type_text_only(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    schedule_reminders(context, user_id)
     await update.message.reply_text(
         "Пожалуйста, ответь текстом 🙂 На этом шаге фото не подойдёт."
     )
 
 
 async def wrong_type_about(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    schedule_reminders(context, user_id)
     await update.message.reply_text(
         "Пожалуйста, отправь текст или фото с подписью 🙂 "
         "Другие типы сообщений на этом шаге не подойдут."
@@ -126,6 +243,8 @@ async def wrong_type_about(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 
 async def wrong_type_about_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    schedule_reminders(context, user_id)
     await update.message.reply_text(
         "Пожалуйста, напиши текстом пару слов о себе (или напиши «продолжить») 🙂"
     )
@@ -134,28 +253,30 @@ async def wrong_type_about_text(update: Update, context: ContextTypes.DEFAULT_TY
 async def agree(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user_id = update.effective_user.id
     answer = update.message.text.strip().lower()
-    progress = context.bot_data.get("progress", {}).get(user_id, {})
 
     if answer in OK_KEYWORDS:
+        schedule_reminders(context, user_id)
         await update.message.reply_text("Отлично! Как тебя зовут?")
         return ASK_NAME
     elif answer in NO_KEYWORDS:
-        context.bot_data.get("progress", {}).pop(user_id, None)
+        cancel_all_reminders(context, user_id)
+        pop_progress(context, user_id)
         await update.message.reply_text(
             "Жаль. Без согласия с правилами вступить нельзя. Если передумаешь — напиши /start."
         )
         return ConversationHandler.END
     else:
+        schedule_reminders(context, user_id)
         await update.message.reply_text("Пожалуйста, ответь «Да» или «Нет».")
         return ASK_AGREE
 
 
 async def ask_source(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Сохраняет имя, спрашивает про источник."""
     user_id = update.effective_user.id
-    progress = context.bot_data.setdefault("progress", {}).setdefault(user_id, {})
+    progress = get_progress(context, user_id)
     progress["name"] = update.message.text
 
+    schedule_reminders(context, user_id)
     await update.message.reply_text(
         "Приятно познакомиться! А как ты узнал(а) о нашей группе?\n\n"
         "<i>(Можно ответить текстом или прикрепить фото — на выбор. "
@@ -166,10 +287,9 @@ async def ask_source(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 
 async def receive_source(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Источник — текст, фото или фото с подписью."""
     user_id = update.effective_user.id
     msg = update.message
-    progress = context.bot_data.setdefault("progress", {}).setdefault(user_id, {})
+    progress = get_progress(context, user_id)
 
     if msg.photo:
         progress["source"] = msg.caption or "(фото без подписи)"
@@ -177,6 +297,7 @@ async def receive_source(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     else:
         progress["source"] = msg.text
 
+    schedule_reminders(context, user_id)
     await msg.reply_text(
         "Отлично! Теперь расскажи больше о своём мини и о себе — что ещё хочется "
         "добавить? Можешь приложить фото своего мини (по желанию).\n\n"
@@ -186,14 +307,12 @@ async def receive_source(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 async def receive_about(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Последний вопрос: текст, фото, фото+подпись или «продолжить»."""
     user_id = update.effective_user.id
     msg = update.message
-    progress = context.bot_data.setdefault("progress", {}).setdefault(user_id, {})
+    progress = get_progress(context, user_id)
 
     text = (msg.text or "").strip().lower()
 
-    # «Продолжить» без фото и текста — пропускаем весь вопрос
     if text in SKIP_KEYWORDS:
         progress["about"] = ""
         progress["photo"] = None
@@ -203,10 +322,9 @@ async def receive_about(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     if msg.photo:
         progress["photo"] = msg.photo[-1].file_id
         if msg.caption:
-            # Фото с подписью = полный ответ
             progress["about"] = msg.caption
             return await finish_survey(update, context)
-        # Фото без подписи — спрашиваем, будет ли текст
+        schedule_reminders(context, user_id)
         await msg.reply_text(
             "📷 Фото получил!\n\n"
             "Хочешь добавить текст о себе и о мини? Напиши его следующим сообщением.\n\n"
@@ -215,21 +333,18 @@ async def receive_about(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         )
         return ASK_ABOUT_TEXT
 
-    # Текст без фото
     progress["photo"] = None
     progress["about"] = msg.text
     return await finish_survey(update, context)
 
 
 async def receive_about_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Ждём текст после фото без подписи."""
     user_id = update.effective_user.id
     msg = update.message
-    progress = context.bot_data.setdefault("progress", {}).setdefault(user_id, {})
+    progress = get_progress(context, user_id)
 
     text = (msg.text or "").strip().lower()
     if text in SKIP_KEYWORDS:
-        # Оставляем только фото, без текста
         progress["about"] = ""
         progress["skipped_about"] = True
     else:
@@ -241,7 +356,8 @@ async def finish_survey(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     user = update.effective_user
     user_id = user.id
 
-    progress = context.bot_data.get("progress", {}).pop(user_id, {})
+    cancel_all_reminders(context, user_id)
+    progress = pop_progress(context, user_id) or {}
 
     apps = context.bot_data.setdefault("applications", {})
     apps[user_id] = {
@@ -252,6 +368,7 @@ async def finish_survey(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         "photo_id": progress.get("photo"),
         "mention": progress.get("mention", user.mention_html()),
         "skipped_about": progress.get("skipped_about", False),
+        "incomplete": False,
         "created": datetime.now(),
     }
 
@@ -268,7 +385,6 @@ async def post_application_and_poll(context: ContextTypes.DEFAULT_TYPE, user_id:
     name = html.escape(app["name"])
     source = html.escape(app["source"])
     about = html.escape(app.get("about", ""))
-    # Приоритет: фото из «о себе», иначе фото из «источника»
     photo_id = app.get("photo_id") or app.get("source_photo")
 
     app["created"] = datetime.now()
@@ -282,6 +398,8 @@ async def post_application_and_poll(context: ContextTypes.DEFAULT_TYPE, user_id:
     note = ""
     if app.get("skipped_about"):
         note = "\n<i>⚠️ Кандидат предпочёл не отвечать на последний вопрос.</i>"
+    elif app.get("incomplete"):
+        note = "\n<i>⚠️ Кандидат не завершил анкету — не ответил на последний вопрос.</i>"
 
     about_display = about if about else "(не ответил)"
 
@@ -455,13 +573,8 @@ async def handle_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE
             logger.error(f"Не удалось отклонить заявку {user_id}: {e}")
 
 
-# --- МОТИВАЦИЯ + FALLBACK (объединено) ---
+# --- МОТИВАЦИЯ + FALLBACK ---
 async def motivation_or_fallback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Обработчик, который ловит:
-    1) текст от пользователя, который ждёт мотивацию;
-    2) текст от пользователя, которого бот не знает → просим /start.
-    """
     user = update.effective_user
     if not user:
         return
@@ -469,7 +582,6 @@ async def motivation_or_fallback(update: Update, context: ContextTypes.DEFAULT_T
 
     awaiting = context.bot_data.get("awaiting_motivation", set())
 
-    # Случай 1: это мотивация
     if user_id in awaiting:
         awaiting.discard(user_id)
         motivation = html.escape(update.message.text)
@@ -491,11 +603,10 @@ async def motivation_or_fallback(update: Update, context: ContextTypes.DEFAULT_T
             logger.error(f"Ошибка при отправке мотивации: {e}")
         return
 
-    # Случай 2: бот не знает, что с этим делать
     if update.effective_chat.type != "private":
         return
     if user_id in context.bot_data.get("progress", {}):
-        return  # в активной анкете — не мешаем
+        return
 
     await update.message.reply_text(
         "⚠️ Извини, произошёл сбой, и я потерял контекст нашего разговора.\n\n"
@@ -549,19 +660,28 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         lines.append(f"📋 <b>Последние {len(sorted_apps)} анкет(ы):</b>")
         for uid, app in sorted_apps:
             lines.append("")
+            # Имя пользователя как кликабельный тег
             name_safe = html.escape(app.get("name", "?"))
             mention = f'<a href="tg://user?id={uid}">{name_safe}</a>'
-            source_safe = html.escape(app.get("source", "(нет)"))
+            source_raw = app.get("source", "(нет)") or "(нет)"
             about_raw = app.get("about", "") or "(не ответил)"
-            about_safe = html.escape(about_raw[:250])
+            source_safe = html.escape(source_raw[:500])
+            about_safe = html.escape(about_raw[:500])
+
+            skipped = app.get("skipped_about")
+            incomplete = app.get("incomplete")
 
             lines.append(f"👤 <b>{mention}</b>")
-            lines.append(f"   Узнал(а): {source_safe}")
-            lines.append(f"   О себе: {about_safe}")
+            if skipped:
+                lines.append("   <i>(предпочёл не отвечать на последний вопрос)</i>")
+            elif incomplete:
+                lines.append("   <i>(не завершил анкету)</i>")
+            lines.append(f"   <b>Узнал(а):</b> {source_safe}")
+            lines.append(f"   <b>О себе:</b> {about_safe}")
 
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
-    # Фото отдельными сообщениями
+    # Фото из последних анкет — отдельными сообщениями, с тегом
     if apps:
         sorted_apps = sorted(
             apps.items(),
@@ -571,10 +691,15 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         for uid, app in sorted_apps:
             photo_id = app.get("photo_id") or app.get("source_photo")
             if photo_id:
+                name_safe = html.escape(app.get("name", "?"))
+                caption = (
+                    f'📷 <a href="tg://user?id={uid}">{name_safe}</a>'
+                )
                 try:
                     await update.message.reply_photo(
                         photo_id,
-                        caption=f"📷 {html.escape(app.get('name', '?'))}",
+                        caption=caption,
+                        parse_mode="HTML",
                     )
                 except Exception as e:
                     logger.warning(f"Не удалось отправить фото: {e}")
@@ -623,11 +748,7 @@ def main() -> None:
         fallbacks=[CommandHandler("start", start)],
     )
 
-    # Логирование
     application.add_handler(TypeHandler(Update, log_update), group=-2)
-
-    # ВСЁ В ОДНОЙ ГРУППЕ, ПО ПОРЯДКУ.
-    # Срабатывает только первый подходящий.
     application.add_handler(CommandHandler("status", cmd_status))
     application.add_handler(conv_handler)
     application.add_handler(PollAnswerHandler(receive_poll_answer))
