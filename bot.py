@@ -15,16 +15,14 @@ from telegram.ext import (
     TypeHandler,
     filters,
     ContextTypes,
+    ApplicationHandlerStop,
 )
 
 # --- НАСТРОЙКИ ---
-# Дефолты — для теста. В Railway перебьются переменными BOT_TOKEN / GROUP_CHAT_ID.
 TOKEN = os.environ.get("BOT_TOKEN") or "8953720376:AAFCUKjvwLiHHgHcv-Sq5uX63X3G7syaZM8"
 GROUP_CHAT_ID = int(os.environ.get("GROUP_CHAT_ID", "-1004469487979"))
 ADMIN_ID = int(os.environ.get("ADMIN_CHAT_ID", "357312670"))
 
-# Тайминги напоминаний (в секундах).
-# Для теста — минуты. Потом вернёшь: 30*60, 2*60*60, 24*60*60, 26*60*60
 T_REMIND_1 = 60
 T_REMIND_2 = 120
 T_REMIND_3 = 180
@@ -130,13 +128,11 @@ async def send_reminder_3(context):
 
 
 async def auto_publish_application(context):
-    """Через T_AUTOPUB: если есть имя и источник — публикуем анкету с пометкой."""
     user_id = context.job.data["user_id"]
     progress = context.bot_data.get("progress", {}).get(user_id)
     if not progress:
         return
 
-    # Минимум: имя и источник. Если чего-то не хватает — просто ждём дальше.
     if not (progress.get("name") and progress.get("source")):
         return
 
@@ -180,17 +176,27 @@ async def log_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             return
 
     kind = "?"
+    text_content = ""
+    photo_id = None
+
     if update.message:
         if update.message.text:
             kind = "start" if update.message.text.startswith("/start") else "text"
+            text_content = update.message.text[:300]
         elif update.message.photo:
             kind = "photo"
+            photo_id = update.message.photo[-1].file_id
+            text_content = (update.message.caption or "")[:300]
         else:
             kind = "message"
     elif update.callback_query:
         kind = "button"
+        text_content = update.callback_query.data or ""
     elif update.poll_answer:
         kind = "vote"
+        # Кто и как проголосовал
+        opts = update.poll_answer.option_ids
+        text_content = f"vote: {opts}"
     elif update.chat_join_request:
         kind = "join_request"
 
@@ -203,7 +209,64 @@ async def log_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         "name": user.full_name,
         "username": user.username,
         "kind": kind,
+        "text": text_content,
+        "photo_id": photo_id,
     })
+
+
+# --- МОТИВАЦИЯ + FALLBACK (высокий приоритет) ---
+async def motivation_or_fallback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if not user:
+        return
+    user_id = user.id
+
+    awaiting = context.bot_data.get("awaiting_motivation", set())
+
+    # --- 1. Мотивация ---
+    if user_id in awaiting:
+        awaiting.discard(user_id)
+        motivation = html.escape(update.message.text)
+
+        # Помечаем, что мотивация уже была использована — второй раз не даём
+        motivation_used = context.bot_data.setdefault("motivation_used", set())
+        motivation_used.add(user_id)
+
+        try:
+            await context.bot.send_message(
+                chat_id=GROUP_CHAT_ID,
+                text=f"💬 <b>Мотивация от участника:</b>\n{motivation}",
+                parse_mode="HTML",
+            )
+            if user_id in context.bot_data.get("applications", {}):
+                await post_application_and_poll(context, user_id, is_revote=True)
+                await update.message.reply_text(
+                    "Спасибо! Твоя мотивация передана в группу, и мы запустили новое голосование. "
+                    "Результат придёт сюда.\n\n"
+                    "<i>Это последняя попытка — если участники снова отклонят, заявка будет закрыта.</i>",
+                    parse_mode="HTML",
+                )
+            else:
+                await update.message.reply_text("Спасибо! Мотивация передана в группу.")
+        except Exception as e:
+            logger.error(f"Ошибка при отправке мотивации: {e}")
+        raise ApplicationHandlerStop
+
+    # --- 2. Пользователь в анкете — не мешаем ---
+    if user_id in context.bot_data.get("progress", {}):
+        return
+
+    # --- 3. Fallback ---
+    if update.effective_chat.type != "private":
+        return
+    if not (update.message and update.message.text):
+        return
+
+    await update.message.reply_text(
+        "⚠️ Извини, произошёл сбой, и я потерял контекст нашего разговора.\n\n"
+        "Пожалуйста, напиши /start, чтобы начать заново."
+    )
+    raise ApplicationHandlerStop
 
 
 # --- АНКЕТА ---
@@ -213,6 +276,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
     awaiting = context.bot_data.get("awaiting_motivation", set())
     awaiting.discard(user_id)
+
+    # Пользователь начал заново — сбрасываем флаг "мотивация использована"
+    motivation_used = context.bot_data.get("motivation_used", set())
+    motivation_used.discard(user_id)
 
     pop_progress(context, user_id)
 
@@ -313,7 +380,6 @@ async def receive_about(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
 
     text = (msg.text or "").strip().lower()
 
-    # «Продолжить» без фото и текста — пропускаем весь вопрос
     if text in SKIP_KEYWORDS:
         progress["about"] = ""
         progress["photo"] = None
@@ -323,10 +389,8 @@ async def receive_about(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     if msg.photo:
         progress["photo"] = msg.photo[-1].file_id
         if msg.caption:
-            # Фото с подписью = полный ответ
             progress["about"] = msg.caption
             return await finish_survey(update, context)
-        # Фото без подписи — спрашиваем, будет ли текст
         schedule_reminders(context, user_id)
         await msg.reply_text(
             "📷 Фото получил!\n\n"
@@ -336,7 +400,6 @@ async def receive_about(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         )
         return ASK_ABOUT_TEXT
 
-    # Текст без фото
     progress["photo"] = None
     progress["about"] = msg.text
     return await finish_survey(update, context)
@@ -536,22 +599,44 @@ async def approve_application(context: ContextTypes.DEFAULT_TYPE, poll_data: dic
 
 
 async def reject_application(context: ContextTypes.DEFAULT_TYPE, poll_data: dict) -> None:
+    user_id = poll_data["user_id"]
+    motivation_used = context.bot_data.get("motivation_used", set())
+
     try:
+        # Если мотивация уже была использована — финальный отказ без нового цикла
+        if user_id in motivation_used:
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=(
+                    "😔 К сожалению, участники снова проголосовали против.\n\n"
+                    "На этом процесс рассмотрения завершён. Спасибо за интерес к группе!"
+                ),
+            )
+            await context.bot.send_message(
+                chat_id=GROUP_CHAT_ID,
+                text=f"❌ Заявка от {poll_data['user_name']} окончательно отклонена.",
+            )
+            motivation_used.discard(user_id)
+            return
+
+        # Первый отказ — просим мотивацию
         await context.bot.send_message(
-            chat_id=poll_data["user_id"],
+            chat_id=user_id,
             text=(
                 "😔 К сожалению, участники проголосовали против твоей заявки.\n\n"
                 "Расскажи, пожалуйста, какая у тебя мотивация быть в группе "
                 "и что ты планируешь делать? Мы передадим это участникам "
-                "и запустим новое голосование."
+                "и запустим новое голосование.\n\n"
+                "<i>Это последняя попытка — если снова отклонят, заявка будет закрыта.</i>"
             ),
+            parse_mode="HTML",
         )
         await context.bot.send_message(
             chat_id=GROUP_CHAT_ID,
             text=f"❌ Заявка от {poll_data['user_name']} отклонена.",
         )
         awaiting = context.bot_data.setdefault("awaiting_motivation", set())
-        awaiting.add(poll_data["user_id"])
+        awaiting.add(user_id)
     except Exception as e:
         logger.error(f"Ошибка при отклонении: {e}")
 
@@ -577,47 +662,6 @@ async def handle_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE
             logger.error(f"Не удалось отклонить заявку {user_id}: {e}")
 
 
-# --- МОТИВАЦИЯ + FALLBACK ---
-async def motivation_or_fallback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user
-    if not user:
-        return
-    user_id = user.id
-
-    awaiting = context.bot_data.get("awaiting_motivation", set())
-
-    if user_id in awaiting:
-        awaiting.discard(user_id)
-        motivation = html.escape(update.message.text)
-        try:
-            await context.bot.send_message(
-                chat_id=GROUP_CHAT_ID,
-                text=f"💬 <b>Мотивация от участника:</b>\n{motivation}",
-                parse_mode="HTML",
-            )
-            if user_id in context.bot_data.get("applications", {}):
-                await post_application_and_poll(context, user_id, is_revote=True)
-                await update.message.reply_text(
-                    "Спасибо! Твоя мотивация передана в группу, и мы запустили новое голосование. "
-                    "Результат придёт сюда."
-                )
-            else:
-                await update.message.reply_text("Спасибо! Мотивация передана в группу.")
-        except Exception as e:
-            logger.error(f"Ошибка при отправке мотивации: {e}")
-        return
-
-    if update.effective_chat.type != "private":
-        return
-    if user_id in context.bot_data.get("progress", {}):
-        return
-
-    await update.message.reply_text(
-        "⚠️ Извини, произошёл сбой, и я потерял контекст нашего разговора.\n\n"
-        "Пожалуйста, напиши /start, чтобы начать заново."
-    )
-
-
 # --- КОМАНДА /status ---
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_user.id != ADMIN_ID:
@@ -625,84 +669,57 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
 
     activity = list(context.bot_data.get("activity_log", []))
-    lines = []
 
-    if activity:
-        recent = list(reversed(activity))[:10]
-        lines.append("🕐 <b>Последние события:</b>")
-        lines.append("")
-        for ev in recent:
-            t = ev["time"].strftime("%d.%m %H:%M:%S")
-            mention = f'<a href="tg://user?id={ev["user_id"]}">{html.escape(ev["name"])}</a>'
-            lines.append(f"<code>{t}</code> — {mention} — <i>{ev['kind']}</i>")
+    if not activity:
+        await update.message.reply_text(
+            "🕐 С ботом ещё никто не общался (с момента последнего запуска)."
+        )
+        return
 
-        last = activity[-1]
-        delta = datetime.now() - last["time"]
-        secs = int(delta.total_seconds())
-        if secs < 60:
-            ago = f"{secs} сек. назад"
-        elif secs < 3600:
-            ago = f"{secs // 60} мин. назад"
-        elif secs < 86400:
-            ago = f"{secs // 3600} ч. назад"
-        else:
-            ago = f"{secs // 86400} дн. назад"
-        lines.append("")
-        lines.append(f"⏱ Последняя активность: <b>{ago}</b>")
+    recent = list(reversed(activity))[:10]
+
+    lines = ["🕐 <b>Последние 10 сообщений:</b>", ""]
+    for ev in recent:
+        t = ev["time"].strftime("%d.%m %H:%M:%S")
+        mention = f'<a href="tg://user?id={ev["user_id"]}">{html.escape(ev["name"])}</a>'
+        kind = ev.get("kind", "?")
+
+        row = f"<code>{t}</code> — {mention} — <i>{kind}</i>"
+        text_content = ev.get("text") or ""
+        if text_content:
+            row += f"\n   ↳ {html.escape(text_content)}"
+        lines.append(row)
+
+    # Информация о последней активности
+    last = activity[-1]
+    delta = datetime.now() - last["time"]
+    secs = int(delta.total_seconds())
+    if secs < 60:
+        ago = f"{secs} сек. назад"
+    elif secs < 3600:
+        ago = f"{secs // 60} мин. назад"
+    elif secs < 86400:
+        ago = f"{secs // 3600} ч. назад"
     else:
-        lines.append("🕐 С ботом ещё никто не общался.")
+        ago = f"{secs // 86400} дн. назад"
 
-    apps = context.bot_data.get("applications", {})
-    if apps:
-        sorted_apps = sorted(
-            apps.items(),
-            key=lambda x: x[1].get("created", datetime.min),
-            reverse=True,
-        )[:3]
-
-        lines.append("")
-        lines.append(f"📋 <b>Последние {len(sorted_apps)} анкет(ы):</b>")
-        for uid, app in sorted_apps:
-            lines.append("")
-            name_safe = html.escape(app.get("name", "?"))
-            mention = f'<a href="tg://user?id={uid}">{name_safe}</a>'
-            source_raw = app.get("source", "(нет)") or "(нет)"
-            about_raw = app.get("about", "") or "(не ответил)"
-            source_safe = html.escape(source_raw[:500])
-            about_safe = html.escape(about_raw[:500])
-
-            skipped = app.get("skipped_about")
-            incomplete = app.get("incomplete")
-
-            lines.append(f"👤 <b>{mention}</b>")
-            if skipped:
-                lines.append("   <i>(предпочёл не отвечать на последний вопрос)</i>")
-            elif incomplete:
-                lines.append("   <i>(не завершил анкету)</i>")
-            lines.append(f"   <b>Узнал(а):</b> {source_safe}")
-            lines.append(f"   <b>О себе:</b> {about_safe}")
+    lines.append("")
+    lines.append(f"⏱ Последняя активность: <b>{ago}</b>")
 
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
-    if apps:
-        sorted_apps = sorted(
-            apps.items(),
-            key=lambda x: x[1].get("created", datetime.min),
-            reverse=True,
-        )[:3]
-        for uid, app in sorted_apps:
-            photo_id = app.get("photo_id") or app.get("source_photo")
-            if photo_id:
-                name_safe = html.escape(app.get("name", "?"))
-                caption = f'📷 <a href="tg://user?id={uid}">{name_safe}</a>'
-                try:
-                    await update.message.reply_photo(
-                        photo_id,
-                        caption=caption,
-                        parse_mode="HTML",
-                    )
-                except Exception as e:
-                    logger.warning(f"Не удалось отправить фото: {e}")
+    # Отправляем фото, если они были в последних сообщениях
+    for ev in recent:
+        photo_id = ev.get("photo_id")
+        if photo_id:
+            try:
+                await update.message.reply_photo(
+                    photo_id,
+                    caption=f'📷 <a href="tg://user?id={ev["user_id"]}">{html.escape(ev["name"])}</a>',
+                    parse_mode="HTML",
+                )
+            except Exception as e:
+                logger.warning(f"Не удалось отправить фото: {e}")
 
 
 # --- ЗАПУСК ---
@@ -749,13 +766,17 @@ def main() -> None:
     )
 
     application.add_handler(TypeHandler(Update, log_update), group=-2)
+
+    # Мотивация + fallback — выше conv_handler
+    application.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND, motivation_or_fallback),
+        group=-1,
+    )
+
     application.add_handler(CommandHandler("status", cmd_status))
     application.add_handler(conv_handler)
     application.add_handler(PollAnswerHandler(receive_poll_answer))
     application.add_handler(ChatJoinRequestHandler(handle_join_request))
-    application.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND, motivation_or_fallback)
-    )
 
     print("Bot is running...")
     application.run_polling()
