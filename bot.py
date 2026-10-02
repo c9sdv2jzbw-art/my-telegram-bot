@@ -19,7 +19,7 @@ from telegram.ext import (
 )
 
 # --- НАСТРОЙКИ ---
-TOKEN = os.environ.get("BOT_TOKEN") or "8953720376:AAFCUKjvwLiHHgHcv-Sq5uX63X3G7syaZM8"
+TOKEN = os.environ.get("BOT_TOKEN")
 GROUP_CHAT_ID = int(os.environ.get("GROUP_CHAT_ID", "-1004469487979"))
 ADMIN_ID = int(os.environ.get("ADMIN_CHAT_ID", "357312670"))
 
