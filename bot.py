@@ -20,7 +20,7 @@ from telegram.ext import (
 
 # --- НАСТРОЙКИ ---
 TOKEN = os.environ.get("BOT_TOKEN")
-GROUP_CHAT_ID = int(os.environ.get("GROUP_CHAT_ID", "-1004469487979"))
+GROUP_CHAT_ID = int(os.environ.get("GROUP_CHAT_ID", "-1004344602549"))
 ADMIN_ID = int(os.environ.get("ADMIN_CHAT_ID", "357312670"))
 
 T_REMIND_1 = 30 * 60
