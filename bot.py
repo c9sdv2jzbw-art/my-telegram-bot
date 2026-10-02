@@ -106,8 +106,8 @@ async def send_reminder_1(context):
     user_id = context.job.data["user_id"]
     await _safe_send(
         context, user_id,
-        "👋 Привет! Ты начал заполнять анкету, но не закончил. Продолжим? "
-        "Ответь на последний вопрос или напиши /start, чтобы начать заново."
+        "👋 Привет! Ты начал(а) заполнять анкету, но пока не завершил(а). "
+        "Продолжим? Просто ответь на текущий вопрос — я жду 🙂"
     )
 
 
@@ -115,8 +115,8 @@ async def send_reminder_2(context):
     user_id = context.job.data["user_id"]
     await _safe_send(
         context, user_id,
-        "⏰ Напоминаем о себе! Мы всё ещё ждём твою анкету. "
-        "Ответь на последний вопрос, чтобы завершить."
+        "⏰ Напоминаем о себе! Мы всё ещё ждём продолжения твоей анкеты. "
+        "Ответь, пожалуйста, на текущий вопрос, чтобы двинуться дальше."
     )
 
 
@@ -125,7 +125,7 @@ async def send_reminder_3(context):
     await _safe_send(
         context, user_id,
         "🙏 Мы очень тебя ждём! Заверши анкету — осталось совсем немного. "
-        "Если не хочешь отвечать на последний вопрос, напиши «продолжить»."
+        "Просто ответь на текущий вопрос, и всё получится."
     )
 
 
@@ -136,7 +136,7 @@ async def auto_publish_application(context):
     if not progress:
         return
 
-    # Минимум: имя и источник (правила уже согласованы, раз есть прогресс)
+    # Минимум: имя и источник. Если чего-то не хватает — просто ждём дальше.
     if not (progress.get("name") and progress.get("source")):
         return
 
@@ -299,8 +299,8 @@ async def receive_source(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     schedule_reminders(context, user_id)
     await msg.reply_text(
-        "Отлично! Теперь расскажи больше о своём мини и о себе — что ещё хочется "
-        "добавить? Можешь приложить фото своего мини (по желанию).\n\n"
+        "Отлично! Теперь расскажи о своём мини/о себе (по желанию)?\n"
+        "Можешь просто отправить фото своего мини.\n\n"
         "Если не хочешь отвечать, просто напиши «продолжить»."
     )
     return ASK_ABOUT
@@ -313,6 +313,7 @@ async def receive_about(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
 
     text = (msg.text or "").strip().lower()
 
+    # «Продолжить» без фото и текста — пропускаем весь вопрос
     if text in SKIP_KEYWORDS:
         progress["about"] = ""
         progress["photo"] = None
@@ -322,8 +323,10 @@ async def receive_about(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     if msg.photo:
         progress["photo"] = msg.photo[-1].file_id
         if msg.caption:
+            # Фото с подписью = полный ответ
             progress["about"] = msg.caption
             return await finish_survey(update, context)
+        # Фото без подписи — спрашиваем, будет ли текст
         schedule_reminders(context, user_id)
         await msg.reply_text(
             "📷 Фото получил!\n\n"
@@ -333,6 +336,7 @@ async def receive_about(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         )
         return ASK_ABOUT_TEXT
 
+    # Текст без фото
     progress["photo"] = None
     progress["about"] = msg.text
     return await finish_survey(update, context)
@@ -660,7 +664,6 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         lines.append(f"📋 <b>Последние {len(sorted_apps)} анкет(ы):</b>")
         for uid, app in sorted_apps:
             lines.append("")
-            # Имя пользователя как кликабельный тег
             name_safe = html.escape(app.get("name", "?"))
             mention = f'<a href="tg://user?id={uid}">{name_safe}</a>'
             source_raw = app.get("source", "(нет)") or "(нет)"
@@ -681,7 +684,6 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
-    # Фото из последних анкет — отдельными сообщениями, с тегом
     if apps:
         sorted_apps = sorted(
             apps.items(),
@@ -692,9 +694,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             photo_id = app.get("photo_id") or app.get("source_photo")
             if photo_id:
                 name_safe = html.escape(app.get("name", "?"))
-                caption = (
-                    f'📷 <a href="tg://user?id={uid}">{name_safe}</a>'
-                )
+                caption = f'📷 <a href="tg://user?id={uid}">{name_safe}</a>'
                 try:
                     await update.message.reply_photo(
                         photo_id,
