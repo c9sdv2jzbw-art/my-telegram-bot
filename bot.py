@@ -23,6 +23,9 @@ TOKEN = os.environ.get("BOT_TOKEN")
 GROUP_CHAT_ID = int(os.environ.get("GROUP_CHAT_ID", "-1004344602549"))
 ADMIN_ID = int(os.environ.get("ADMIN_CHAT_ID", "357312670"))
 
+# Основатель группы, обладающий правом вето
+SVETLANA_ID = 1118599657
+
 T_REMIND_1 = 30 * 60
 T_REMIND_2 = 2 * 60 * 60
 T_REMIND_3 = 14 * 60 * 60
@@ -41,8 +44,9 @@ RULES_TEXT = (
 )
 
 VOTE_NOTE = (
-    "ℹ️ <i>Напоминаем: для одобрения заявки нужно 1/4 голосов «За» от числа участников группы. "
-    "У каждого участника есть право вето — любой голос «Против» блокирует вступление.</i>"
+    "ℹ️ <i>Напоминаем: для одобрения заявки нужно 1/6 голосов «За» от числа участников группы. "
+    "Отклонить заявку можно 1/6 голосов «Против». "
+    "Основатель группы имеет право вето — её голос «Против» блокирует вступление мгновенно.</i>"
 )
 
 OK_KEYWORDS = {"да", "yes", "ага", "ок", "ok", "согласен", "согласна"}
@@ -194,7 +198,6 @@ async def log_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         text_content = update.callback_query.data or ""
     elif update.poll_answer:
         kind = "vote"
-        # Кто и как проголосовал
         opts = update.poll_answer.option_ids
         text_content = f"vote: {opts}"
     elif update.chat_join_request:
@@ -223,12 +226,10 @@ async def motivation_or_fallback(update: Update, context: ContextTypes.DEFAULT_T
 
     awaiting = context.bot_data.get("awaiting_motivation", set())
 
-    # --- 1. Мотивация ---
     if user_id in awaiting:
         awaiting.discard(user_id)
         motivation = html.escape(update.message.text)
 
-        # Помечаем, что мотивация уже была использована — второй раз не даём
         motivation_used = context.bot_data.setdefault("motivation_used", set())
         motivation_used.add(user_id)
 
@@ -252,11 +253,9 @@ async def motivation_or_fallback(update: Update, context: ContextTypes.DEFAULT_T
             logger.error(f"Ошибка при отправке мотивации: {e}")
         raise ApplicationHandlerStop
 
-    # --- 2. Пользователь в анкете — не мешаем ---
     if user_id in context.bot_data.get("progress", {}):
         return
 
-    # --- 3. Fallback ---
     if update.effective_chat.type != "private":
         return
     if not (update.message and update.message.text):
@@ -277,7 +276,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     awaiting = context.bot_data.get("awaiting_motivation", set())
     awaiting.discard(user_id)
 
-    # Пользователь начал заново — сбрасываем флаг "мотивация использована"
     motivation_used = context.bot_data.get("motivation_used", set())
     motivation_used.discard(user_id)
 
@@ -506,8 +504,9 @@ async def post_application_and_poll(context: ContextTypes.DEFAULT_TYPE, user_id:
         members = await context.bot.get_chat_member_count(GROUP_CHAT_ID)
     except Exception as e:
         logger.warning(f"Не удалось получить число участников: {e}")
-        members = 4
-    required_yes = max(1, ceil(members / 4))
+        members = 6
+    # Порог 1/6 от числа участников группы
+    required_yes = max(1, ceil(members / 6))
 
     context.bot_data[poll_msg.poll.id] = {
         "chat_id": GROUP_CHAT_ID,
@@ -550,12 +549,21 @@ async def receive_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE
         poll_data["votes_no"] += 1
         poll_data["voters"][user_id] = 1
 
-    if poll_data["votes_no"] >= 1:
+    # 🚫 ПРАВО ВЕТО — только у Светланы (основателя)
+    if poll_data["voters"].get(SVETLANA_ID) == 1:
         poll_data["decided"] = True
         await safe_stop_poll(context, poll_data)
         await reject_application(context, poll_data)
         return
 
+    # ⛔ Отклонение обычными голосами: 1/6 от участников «Против»
+    if poll_data["votes_no"] >= poll_data["required_yes"]:
+        poll_data["decided"] = True
+        await safe_stop_poll(context, poll_data)
+        await reject_application(context, poll_data)
+        return
+
+    # ✅ Одобрение: 1/6 «За»
     if poll_data["votes_yes"] >= poll_data["required_yes"]:
         poll_data["decided"] = True
         await safe_stop_poll(context, poll_data)
@@ -603,7 +611,6 @@ async def reject_application(context: ContextTypes.DEFAULT_TYPE, poll_data: dict
     motivation_used = context.bot_data.get("motivation_used", set())
 
     try:
-        # Если мотивация уже была использована — финальный отказ без нового цикла
         if user_id in motivation_used:
             await context.bot.send_message(
                 chat_id=user_id,
@@ -619,7 +626,6 @@ async def reject_application(context: ContextTypes.DEFAULT_TYPE, poll_data: dict
             motivation_used.discard(user_id)
             return
 
-        # Первый отказ — просим мотивацию
         await context.bot.send_message(
             chat_id=user_id,
             text=(
@@ -690,7 +696,6 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             row += f"\n   ↳ {html.escape(text_content)}"
         lines.append(row)
 
-    # Информация о последней активности
     last = activity[-1]
     delta = datetime.now() - last["time"]
     secs = int(delta.total_seconds())
@@ -708,7 +713,6 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
-    # Отправляем фото, если они были в последних сообщениях
     for ev in recent:
         photo_id = ev.get("photo_id")
         if photo_id:
@@ -767,7 +771,6 @@ def main() -> None:
 
     application.add_handler(TypeHandler(Update, log_update), group=-2)
 
-    # Мотивация + fallback — выше conv_handler
     application.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, motivation_or_fallback),
         group=-1,
