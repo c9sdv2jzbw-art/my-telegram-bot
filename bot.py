@@ -4,7 +4,7 @@ import logging
 from collections import deque
 from datetime import datetime
 from math import ceil
-from telegram import Update
+from telegram import Update, InputMediaPhoto
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -68,6 +68,30 @@ def get_progress(context, user_id):
 
 def pop_progress(context, user_id):
     return context.bot_data.get("progress", {}).pop(user_id, None)
+
+
+def add_photo(progress: dict, file_id: str) -> None:
+    if not file_id:
+        return
+    photos = progress.setdefault("photos", [])
+    if file_id not in photos:
+        photos.append(file_id)
+
+
+def collect_photos(data: dict) -> list[str]:
+    result = []
+
+    for fid in data.get("photos", []) or []:
+        if fid and fid not in result:
+            result.append(fid)
+
+    # совместимость со старыми полями
+    for key in ("source_photo", "photo", "photo_id"):
+        fid = data.get(key)
+        if fid and fid not in result:
+            result.append(fid)
+
+    return result
 
 
 # --- НАПОМИНАНИЯ ---
@@ -142,13 +166,16 @@ async def auto_publish_application(context):
 
     cancel_all_reminders(context, user_id)
 
+    photos = collect_photos(progress)
+
     apps = context.bot_data.setdefault("applications", {})
     apps[user_id] = {
         "name": progress.get("name", ""),
         "source": progress.get("source", ""),
         "source_photo": progress.get("source_photo"),
         "about": progress.get("about", ""),
-        "photo_id": progress.get("photo"),
+        "photos": photos,
+        "photo_id": photos[0] if photos else None,
         "mention": progress.get("mention", ""),
         "skipped_about": False,
         "incomplete": True,
@@ -357,8 +384,10 @@ async def receive_source(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     progress = get_progress(context, user_id)
 
     if msg.photo:
+        file_id = msg.photo[-1].file_id
+        add_photo(progress, file_id)
         progress["source"] = msg.caption or "(фото без подписи)"
-        progress["source_photo"] = msg.photo[-1].file_id
+        progress["source_photo"] = file_id
     else:
         progress["source"] = msg.text
 
@@ -385,15 +414,15 @@ async def receive_about(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         return await finish_survey(update, context)
 
     if msg.photo:
-        progress["photo"] = msg.photo[-1].file_id
+        add_photo(progress, msg.photo[-1].file_id)
         if msg.caption:
             progress["about"] = msg.caption
-            return await finish_survey(update, context)
+
         schedule_reminders(context, user_id)
         await msg.reply_text(
-            "📷 Фото получил!\n\n"
-            "Хочешь добавить текст о себе и о мини? Напиши его следующим сообщением.\n\n"
-            "Если хочешь оставить <b>только фото</b> — просто напиши «продолжить».",
+            "📷 Фото добавил!\n\n"
+            "Можешь отправить ещё фото или текст о себе и о мини.\n\n"
+            "Когда закончишь — напиши «продолжить».",
             parse_mode="HTML",
         )
         return ASK_ABOUT_TEXT
@@ -417,6 +446,22 @@ async def receive_about_text(update: Update, context: ContextTypes.DEFAULT_TYPE)
     return await finish_survey(update, context)
 
 
+async def receive_about_text_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    user_id = update.effective_user.id
+    msg = update.message
+    progress = get_progress(context, user_id)
+
+    add_photo(progress, msg.photo[-1].file_id)
+    if msg.caption:
+        progress["about"] = msg.caption
+
+    schedule_reminders(context, user_id)
+    await msg.reply_text(
+        "📷 Фото добавил. Можешь отправить ещё фото/текст или написать «продолжить»."
+    )
+    return ASK_ABOUT_TEXT
+
+
 async def finish_survey(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user = update.effective_user
     user_id = user.id
@@ -424,13 +469,16 @@ async def finish_survey(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     cancel_all_reminders(context, user_id)
     progress = pop_progress(context, user_id) or {}
 
+    photos = collect_photos(progress)
+
     apps = context.bot_data.setdefault("applications", {})
     apps[user_id] = {
         "name": progress.get("name", ""),
         "source": progress.get("source", ""),
         "source_photo": progress.get("source_photo"),
         "about": progress.get("about", ""),
-        "photo_id": progress.get("photo"),
+        "photos": photos,
+        "photo_id": photos[0] if photos else None,
         "mention": progress.get("mention", user.mention_html()),
         "skipped_about": progress.get("skipped_about", False),
         "incomplete": False,
@@ -445,12 +493,58 @@ async def finish_survey(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     return ConversationHandler.END
 
 
+async def send_application_to_group(context: ContextTypes.DEFAULT_TYPE, photos: list[str], text: str) -> None:
+    if not photos:
+        await context.bot.send_message(
+            chat_id=GROUP_CHAT_ID,
+            text=text,
+            parse_mode="HTML",
+        )
+        return
+
+    if len(photos) == 1:
+        await context.bot.send_photo(
+            chat_id=GROUP_CHAT_ID,
+            photo=photos[0],
+            caption=text,
+            parse_mode="HTML",
+        )
+        return
+
+    # Telegram: send_media_group принимает от 2 до 10 фото
+    for start in range(0, len(photos), 10):
+        chunk = photos[start:start + 10]
+        media = []
+
+        for idx, file_id in enumerate(chunk):
+            if start == 0 and idx == 0:
+                media.append(
+                    InputMediaPhoto(
+                        media=file_id,
+                        caption=text,
+                        parse_mode="HTML",
+                    )
+                )
+            else:
+                media.append(InputMediaPhoto(media=file_id))
+
+        if len(media) == 1:
+            await context.bot.send_photo(
+                chat_id=GROUP_CHAT_ID,
+                photo=media[0].media,
+            )
+        else:
+            await context.bot.send_media_group(
+                chat_id=GROUP_CHAT_ID,
+                media=media,
+            )
+
+
 async def post_application_and_poll(context: ContextTypes.DEFAULT_TYPE, user_id: int, is_revote: bool) -> None:
     app = context.bot_data["applications"][user_id]
     name = html.escape(app["name"])
     source = html.escape(app["source"])
     about = html.escape(app.get("about", ""))
-    photo_id = app.get("photo_id") or app.get("source_photo")
 
     app["created"] = datetime.now()
 
@@ -478,19 +572,8 @@ async def post_application_and_poll(context: ContextTypes.DEFAULT_TYPE, user_id:
         f"{VOTE_NOTE}"
     )
 
-    if photo_id:
-        await context.bot.send_photo(
-            chat_id=GROUP_CHAT_ID,
-            photo=photo_id,
-            caption=survey_text,
-            parse_mode="HTML",
-        )
-    else:
-        await context.bot.send_message(
-            chat_id=GROUP_CHAT_ID,
-            text=survey_text,
-            parse_mode="HTML",
-        )
+    photos = collect_photos(app)
+    await send_application_to_group(context, photos, survey_text)
 
     poll_msg = await context.bot.send_poll(
         chat_id=GROUP_CHAT_ID,
@@ -762,8 +845,12 @@ def main() -> None:
                 ),
             ],
             ASK_ABOUT_TEXT: [
+                MessageHandler(filters.PHOTO, receive_about_text_photo),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, receive_about_text),
-                MessageHandler(~filters.TEXT & ~filters.COMMAND, wrong_type_about_text),
+                MessageHandler(
+                    ~filters.PHOTO & ~filters.TEXT & ~filters.COMMAND,
+                    wrong_type_about_text,
+                ),
             ],
         },
         fallbacks=[CommandHandler("start", start)],
